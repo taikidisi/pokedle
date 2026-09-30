@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pokedle Twitch</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+html,body{margin:0;height:100%;background:transparent;overflow:hidden;font-family:'Press Start 2P','Courier New',monospace;color:#fff}
+#stage{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.6vh;transition:opacity .3s}
+#stage.hidden{opacity:0}
+.fx{text-shadow:.35vh .35vh 0 #000,-.2vh -.2vh 0 #000}
+#title{position:fixed;top:3vh;left:2.5vw;font-size:4vh;color:#fff}
+#title b{color:#ff4d6d;font-weight:normal}
+#round{position:fixed;top:3.5vh;right:2.5vw;font-size:2.6vh}
+#status{position:fixed;top:9vh;right:2.5vw;font-size:1.3vh;background:#000a;padding:.8vh 1vw;color:#7CFC7C}
+#status.err{color:#ff8080}
+canvas{width:38vh;height:38vh;image-rendering:pixelated;filter:drop-shadow(0 0 1.2vh #000)}
+#hint{font-size:2.4vh}
+#last{font-size:1.6vh;min-height:2vh;color:#ffd166}
+#result{font-size:2.6vh;min-height:3vh;color:#7CFC7C;text-align:center}
+#result.fail{color:#ff8080}
+#clues{display:grid;grid-template-columns:1fr 1fr;gap:1.2vh 1.2vw;width:min(62vw,120vh)}
+.clue{background:#050008;border:.5vh solid #fff;padding:1.6vh 1vw;text-align:center;outline:.5vh solid #000}
+.clue small{display:block;font-size:1.4vh;color:#b9a7c9;margin-bottom:1.2vh}
+.clue span{font-size:2.4vh}
+.clue.new{animation:pop .4s}
+@keyframes pop{from{background:#ff4d6d}to{background:#050008}}
+#tries{font-size:1.8vh}
+#panel{position:fixed;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;gap:2vh;background:#000c;text-align:center}
+#panel.on{display:flex}
+#panel h2{font-size:4vh;margin:0}
+#panel ol{list-style:none;padding:0;margin:0;font-size:2.6vh;line-height:1.9}
+#test{position:fixed;bottom:1vh;left:1vw;display:none;font:inherit;font-size:1.6vh;padding:1vh;width:26vw}
+#msg{position:fixed;top:45vh;width:100%;text-align:center;font-size:2vh;display:none}
+@media (prefers-reduced-motion:reduce){.clue.new{animation:none}}
+</style>
+</head>
+<body>
+<div id="msg" class="fx"></div>
+<div id="title" class="fx">POKE<b>DLE</b></div>
+<div id="round" class="fx"></div>
+<div id="status"></div>
+<div id="stage" class="hidden">
+  <canvas id="cv" width="512" height="512"></canvas>
+  <div id="hint" class="fx"></div>
+  <div id="last" class="fx"></div>
+  <div id="result" class="fx"></div>
+  <div id="clues"></div>
+  <div id="tries" class="fx"></div>
+</div>
+<div id="panel"><h2 class="fx">RESULTADOS</h2><ol id="rank" class="fx"></ol><div id="again" class="fx"></div></div>
+<input id="test" placeholder="modo prueba: escribí un pokémon y Enter">
+
+<script src="https://cdn.jsdelivr.net/npm/tmi.js@1.8.5/dist/tmi.min.js"></script>
+<script>
+/* ============ CONFIGURACIÓN ============
+   Todo se puede cambiar acá o por la URL:
+   ?channel=nombre  &rounds=5  &tries=8  &regions=kanto,johto  &test=1            */
+const P = new URLSearchParams(location.search);
+const CONFIG = {
+  channel: (P.get('channel') || '').toLowerCase().replace('#',''),
+  rounds: +P.get('rounds') || 5,
+  maxAttempts: +P.get('tries') || 8,
+  startCommand: '!pokedle',          // lo arranca un mod o el streamer
+  guessCommand: '!guess',
+  revealSeconds: 6,
+  summarySeconds: 15,
+  pixelLevels: [6, 9, 14, 22, 36, 64], // tamaño del pixelado según los fallos
+  regions: [['Kanto',1,151],['Johto',152,251],['Hoenn',252,386],['Sinnoh',387,493],
+            ['Teselia',494,649],['Kalos',650,721],['Alola',722,809],['Galar',810,898],['Paldea',906,1025]],
+  enabledRegions: P.get('regions') ? P.get('regions').split(',') : null, // null = todas
+  test: P.get('test') === '1'
+};
+
+const TYPES={normal:'Normal',fire:'Fuego',water:'Agua',electric:'Eléctrico',grass:'Planta',ice:'Hielo',fighting:'Lucha',poison:'Veneno',ground:'Tierra',flying:'Volador',psychic:'Psíquico',bug:'Bicho',rock:'Roca',ghost:'Fantasma',dragon:'Dragón',dark:'Siniestro',steel:'Acero',fairy:'Hada'};
+const COLORS={black:'Negro',blue:'Azul',brown:'Marrón',gray:'Gris',green:'Verde',pink:'Rosa',purple:'Morado',red:'Rojo',white:'Blanco',yellow:'Amarillo'};
+const CLUE_LABELS=['TIPO','REGIÓN','COLOR','ALTURA'];
+
+const $ = id => document.getElementById(id);
+const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]/g,'');
+const cv = $('cv'), ctx = cv.getContext('2d');
+let S = {phase:'idle', round:0, scores:{}, cur:null, attempts:0, used:new Set()};
+let timer = null;
+
+function pool(){
+  const on = CONFIG.enabledRegions ? CONFIG.enabledRegions.map(norm) : null;
+  const list = CONFIG.regions.filter(r => !on || on.includes(norm(r[0])));
+  return list.length ? list : CONFIG.regions;
+}
+function pickId(){
+  const rs = pool();
+  for (let i=0;i<50;i++){
+    const r = rs[Math.floor(Math.random()*rs.length)];
+    const id = r[1] + Math.floor(Math.random()*(r[2]-r[1]+1));
+    if (!S.used.has(id)) { S.used.add(id); return id; }
+  }
+  return 25;
+}
+const regionOf = id => (CONFIG.regions.find(r => id>=r[1] && id<=r[2]) || ['?'])[0];
+const loadImg = src => new Promise((ok,no)=>{const i=new Image();i.crossOrigin='anonymous';i.onload=()=>ok(i);i.onerror=no;i.src=src;});
+
+async function loadPokemon(){
+  for (let t=0;t<5;t++){
+    try{
+      const id = pickId();
+      const [p, sp] = await Promise.all([
+        fetch('https://pokeapi.co/api/v2/pokemon/'+id).then(r=>r.json()),
+        fetch('https://pokeapi.co/api/v2/pokemon-species/'+id).then(r=>r.json())
+      ]);
+      const url = p.sprites.other['official-artwork'].front_default || p.sprites.front_default;
+      const es = (sp.names.find(n=>n.language.name==='es')||{}).name || sp.name;
+      return {
+        id, nameEs: es, names: [norm(es), norm(sp.name)],
+        image: await loadImg(url),
+        clues: [
+          p.types.map(x=>TYPES[x.type.name]||x.type.name).join(' / '),
+          regionOf(id),
+          COLORS[sp.color.name]||sp.color.name,
+          (p.height/10).toFixed(1).replace('.',',')+' m'
+        ]
+      };
+    }catch(e){}
+  }
+  return null;
+}
+
+function draw(full){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if (!S.cur) return;
+  if (full){ ctx.imageSmoothingEnabled = true; ctx.drawImage(S.cur.image,0,0,cv.width,cv.height); return; }
+  const lv = CONFIG.pixelLevels, n = lv[Math.min(S.attempts, lv.length-1)];
+  const off = document.createElement('canvas'); off.width = off.height = n;
+  off.getContext('2d').drawImage(S.cur.image,0,0,n,n);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off,0,0,cv.width,cv.height);
+}
+
+let shown = 0;
+function renderClues(){
+  const open = Math.min(1 + S.attempts, 4);
+  $('clues').innerHTML = CLUE_LABELS.map((l,i)=>
+    `<div class="clue${i<open && i>=shown && shown>0?' new':''}"><small>${l}</small><span>${i<open? S.cur.clues[i] : '???'}</span></div>`).join('');
+  shown = open;
+}
+function render(){
+  $('round').textContent = `RONDA ${S.round} / ${CONFIG.rounds}`;
+  $('hint').textContent = `${CONFIG.guessCommand} + pokemon`;
+  $('tries').textContent = `INTENTOS: ${S.attempts} / ${CONFIG.maxAttempts}`;
+  renderClues(); draw(false);
+}
+
+async function startGame(){
+  S = {phase:'loading', round:0, scores:{}, cur:null, attempts:0, used:new Set()};
+  $('panel').classList.remove('on');
+  nextRound();
+}
+async function nextRound(){
+  S.round++; S.attempts = 0; shown = 0; S.phase = 'loading';
+  $('result').textContent = ''; $('last').textContent = '';
+  const p = await loadPokemon();
+  if (!p){ msg('No se pudo cargar PokéAPI. Reintentá con '+CONFIG.startCommand); S.phase='idle'; $('stage').classList.add('hidden'); return; }
+  S.cur = p; S.phase = 'playing';
+  $('stage').classList.remove('hidden');
+  render();
+}
+function reveal(winner){
+  S.phase = 'reveal'; draw(true);
+  const r = $('result');
+  if (winner){ S.scores[winner] = (S.scores[winner]||0)+1; r.className='fx'; r.textContent = `¡${S.cur.nameEs.toUpperCase()}! LO ADIVINÓ ${winner.toUpperCase()}`; }
+  else { r.className='fx fail'; r.textContent = `ERA ${S.cur.nameEs.toUpperCase()}`; }
+  $('clues').querySelectorAll('span').forEach((s,i)=>s.textContent=S.cur.clues[i]);
+  timer = setTimeout(()=> S.round >= CONFIG.rounds ? summary() : nextRound(), CONFIG.revealSeconds*1000);
+}
+function summary(){
+  S.phase = 'summary';
+  $('stage').classList.add('hidden');
+  const top = Object.entries(S.scores).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  $('rank').innerHTML = top.length ? top.map((t,i)=>`<li>${i+1}. ${esc(t[0])} - ${t[1]}</li>`).join('') : '<li>Nadie acertó</li>';
+  $('again').textContent = 'Un mod puede escribir '+CONFIG.startCommand+' para jugar de nuevo';
+  $('panel').classList.add('on');
+  timer = setTimeout(()=>{ $('panel').classList.remove('on'); S.phase='idle'; }, CONFIG.summarySeconds*1000);
+}
+const esc = s => s.replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function handleGuess(user, text){
+  if (S.phase !== 'playing') return;
+  const g = norm(text); if (!g) return;
+  if (S.cur.names.includes(g)) return reveal(user);
+  S.attempts++;
+  $('last').textContent = `${user}: ${text.slice(0,20)}`;
+  if (S.attempts >= CONFIG.maxAttempts) return reveal(null);
+  render();
+}
+function msg(t){ const m=$('msg'); m.textContent=t; m.style.display='block'; setTimeout(()=>m.style.display='none',6000); }
+function setStatus(t,err){ const s=$('status'); s.textContent=t; s.className=err?'err':''; }
+
+/* ============ CHAT ============ */
+if (CONFIG.test){
+  setStatus('● MODO PRUEBA');
+  const t = $('test'); t.style.display='block';
+  t.addEventListener('keydown', e=>{ if(e.key==='Enter' && t.value.trim()){ handleGuess('Prueba', t.value.trim()); t.value=''; }});
+  startGame();
+} else if (!CONFIG.channel){
+  msg('Falta el canal. Agregá ?channel=nombredelcanal a la URL');
+} else {
+  const client = new tmi.Client({channels:[CONFIG.channel]});
+  client.on('connected', ()=>setStatus('● TWITCH CONECTADO'));
+  client.on('disconnected', ()=>setStatus('● TWITCH DESCONECTADO', true));
+  client.on('message', (ch, tags, message)=>{
+    const m = message.trim(), low = m.toLowerCase();
+    if (low === CONFIG.startCommand){
+      const ok = tags.mod || (tags.badges && tags.badges.broadcaster);
+      if (ok && (S.phase==='idle' || S.phase==='summary')){ clearTimeout(timer); startGame(); }
+      return;
+    }
+    if (low.startsWith(CONFIG.guessCommand+' '))
+      handleGuess(tags['display-name'] || tags.username, m.slice(CONFIG.guessCommand.length).trim());
+  });
+  client.connect().catch(()=>setStatus('● NO SE PUDO CONECTAR', true));
+}
+</script>
+</body>
+</html>
